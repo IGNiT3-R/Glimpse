@@ -1,0 +1,333 @@
+//! OCR 文字识别模块
+//! 使用 paddle-ocr-rs (基于 ONNX Runtime 的 PaddleOCR)
+//! 模型嵌入到二进制中，支持离线使用
+//! Windows OCR API 作为备选方案
+
+use image::DynamicImage;
+use paddle_ocr_rs::ocr_lite::OcrLite;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::fs;
+use std::io::Write;
+
+/// OCR 识别结果
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OcrResult {
+    /// 识别出的文本
+    pub text: String,
+    /// 识别的语言/引擎
+    pub language: String,
+}
+
+/// 嵌入的模型文件
+/// 编译时会将模型文件打包到二进制中
+static MODEL_DET: &[u8] = include_bytes!("../models/ch_PP-OCRv4_det_infer.onnx");
+static MODEL_CLS: &[u8] = include_bytes!("../models/ch_ppocr_mobile_v2.0_cls_infer.onnx");
+static MODEL_REC: &[u8] = include_bytes!("../models/ch_PP-OCRv4_rec_infer.onnx");
+
+/// 全局 OCR 引擎实例（懒加载）
+/// 使用 Mutex 包装以支持可变借用
+static OCR_ENGINE: OnceLock<Option<std::sync::Mutex<OcrLite>>> = OnceLock::new();
+
+/// 获取模型缓存目录
+fn get_models_dir() -> Result<PathBuf, String> {
+    // 使用临时目录存放解压的模型
+    let temp_dir = std::env::temp_dir().join("glimpse_ocr_models");
+
+    if !temp_dir.exists() {
+        fs::create_dir_all(&temp_dir)
+            .map_err(|e| format!("创建模型缓存目录失败: {}", e))?;
+    }
+
+    Ok(temp_dir)
+}
+
+/// 将嵌入的模型写入临时文件
+fn extract_model(data: &[u8], name: &str, models_dir: &PathBuf) -> Result<PathBuf, String> {
+    let model_path = models_dir.join(name);
+
+    // 如果文件已存在且大小匹配，跳过写入
+    if model_path.exists() {
+        if let Ok(metadata) = fs::metadata(&model_path) {
+            if metadata.len() == data.len() as u64 {
+                println!("[DEBUG] 模型缓存已存在: {}", name);
+                return Ok(model_path);
+            }
+        }
+    }
+
+    println!("[DEBUG] 解压模型到缓存: {} ({} bytes)", name, data.len());
+
+    let mut file = fs::File::create(&model_path)
+        .map_err(|e| format!("创建模型文件失败: {}", e))?;
+    file.write_all(data)
+        .map_err(|e| format!("写入模型文件失败: {}", e))?;
+
+    Ok(model_path)
+}
+
+/// 确保所有模型文件已解压到临时目录
+fn ensure_models() -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let models_dir = get_models_dir()?;
+
+    let det_path = extract_model(MODEL_DET, "ch_PP-OCRv4_det_infer.onnx", &models_dir)?;
+    let cls_path = extract_model(MODEL_CLS, "ch_ppocr_mobile_v2.0_cls_infer.onnx", &models_dir)?;
+    let rec_path = extract_model(MODEL_REC, "ch_PP-OCRv4_rec_infer.onnx", &models_dir)?;
+
+    Ok((det_path, cls_path, rec_path))
+}
+
+/// 获取或初始化 OCR 引擎
+fn get_ocr_engine() -> Option<&'static std::sync::Mutex<OcrLite>> {
+    OCR_ENGINE.get_or_init(|| {
+        println!("[DEBUG] 正在初始化 PaddleOCR (ONNX) 引擎...");
+
+        // 确保模型已解压
+        let (det_path, cls_path, rec_path) = match ensure_models() {
+            Ok(paths) => paths,
+            Err(e) => {
+                println!("[ERROR] 模型解压失败: {}", e);
+                return None;
+            }
+        };
+
+        // 创建 OCR 引擎
+        let mut ocr = OcrLite::new();
+
+        // 初始化模型
+        match ocr.init_models(
+            det_path.to_str().unwrap(),
+            cls_path.to_str().unwrap(),
+            rec_path.to_str().unwrap(),
+            2, // 线程数
+        ) {
+            Ok(_) => {
+                println!("[DEBUG] PaddleOCR 引擎初始化成功");
+                Some(std::sync::Mutex::new(ocr))
+            }
+            Err(e) => {
+                println!("[ERROR] PaddleOCR 引擎初始化失败: {:?}", e);
+                None
+            }
+        }
+    }).as_ref()
+}
+
+/// 使用 PaddleOCR 识别图像中的文字
+pub fn recognize_text(image: &DynamicImage) -> Result<OcrResult, String> {
+    println!("[DEBUG] 开始 OCR 识别，图像尺寸: {}x{}", image.width(), image.height());
+
+    // 尝试使用 PaddleOCR
+    if let Some(engine_mutex) = get_ocr_engine() {
+        if let Ok(mut engine) = engine_mutex.lock() {
+            match recognize_with_paddle_ocr(&mut engine, image) {
+                Ok(result) if !result.text.trim().is_empty() => {
+                    println!("[DEBUG] PaddleOCR 识别成功，文本长度: {}", result.text.len());
+                    return Ok(result);
+                }
+                Ok(_) => {
+                    println!("[DEBUG] PaddleOCR 未识别到文字，尝试 Windows OCR");
+                }
+                Err(e) => {
+                    println!("[DEBUG] PaddleOCR 识别失败: {}，尝试 Windows OCR", e);
+                }
+            }
+        }
+    } else {
+        println!("[DEBUG] PaddleOCR 引擎不可用，使用 Windows OCR");
+    }
+
+    // 回退到 Windows OCR
+    #[cfg(windows)]
+    {
+        recognize_with_windows_ocr(image)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("OCR 引擎初始化失败".to_string())
+    }
+}
+
+/// 使用 PaddleOCR 识别
+fn recognize_with_paddle_ocr(engine: &mut OcrLite, image: &DynamicImage) -> Result<OcrResult, String> {
+    // 转换为 RGB8 格式
+    let rgb_image = image.to_rgb8();
+
+    // 调用识别
+    let result = engine.detect(
+        &rgb_image,
+        50,    // padding
+        1024,  // max_side_len
+        0.5,   // box_score_thresh
+        0.3,   // box_thresh
+        1.6,   // unclip_ratio
+        true,  // do_angle
+        true,  // most_angle
+    ).map_err(|e| format!("PaddleOCR 识别错误: {:?}", e))?;
+
+    // 提取所有文本
+    let texts: Vec<String> = result.text_blocks
+        .iter()
+        .map(|block| block.text.clone())
+        .collect();
+
+    let text = texts.join("\n");
+
+    Ok(OcrResult {
+        text,
+        language: "paddle-ocr-zh".to_string(),
+    })
+}
+
+// ============ Windows OCR 备选方案 ============
+
+#[cfg(windows)]
+use windows::{
+    core::HSTRING,
+    Graphics::Imaging::BitmapDecoder,
+    Media::Ocr::OcrEngine,
+    Storage::Streams::{DataWriter, InMemoryRandomAccessStream},
+    Globalization::Language,
+};
+
+/// 使用 Windows OCR API 识别
+#[cfg(windows)]
+fn recognize_with_windows_ocr(image: &DynamicImage) -> Result<OcrResult, String> {
+    println!("[DEBUG] 使用 Windows OCR 识别");
+
+    // 将图像转换为 PNG 字节
+    let png_bytes = image_to_png_bytes(image)?;
+
+    // 调用 Windows OCR
+    let mut result = recognize_from_bytes(&png_bytes)?;
+
+    // 后处理
+    result.text = postprocess_text(&result.text);
+
+    Ok(result)
+}
+
+/// 将图像转换为 PNG 字节
+#[cfg(windows)]
+fn image_to_png_bytes(image: &DynamicImage) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut bytes);
+    image
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| format!("图像编码失败: {}", e))?;
+    Ok(bytes)
+}
+
+/// 从 PNG 字节数据识别文字
+#[cfg(windows)]
+fn recognize_from_bytes(png_bytes: &[u8]) -> Result<OcrResult, String> {
+    let stream = InMemoryRandomAccessStream::new()
+        .map_err(|e| format!("创建内存流失败: {}", e))?;
+
+    let writer = DataWriter::CreateDataWriter(&stream)
+        .map_err(|e| format!("创建数据写入器失败: {}", e))?;
+
+    writer.WriteBytes(png_bytes)
+        .map_err(|e| format!("写入图像数据失败: {}", e))?;
+
+    writer.StoreAsync()
+        .map_err(|e| format!("存储数据失败: {}", e))?
+        .get()
+        .map_err(|e| format!("等待存储完成失败: {}", e))?;
+
+    writer.FlushAsync()
+        .map_err(|e| format!("刷新缓冲区失败: {}", e))?
+        .get()
+        .map_err(|e| format!("等待刷新完成失败: {}", e))?;
+
+    stream.Seek(0)
+        .map_err(|e| format!("重置流位置失败: {}", e))?;
+
+    let decoder = BitmapDecoder::CreateAsync(&stream)
+        .map_err(|e| format!("创建解码器失败: {}", e))?
+        .get()
+        .map_err(|e| format!("等待解码器创建失败: {}", e))?;
+
+    let bitmap = decoder.GetSoftwareBitmapAsync()
+        .map_err(|e| format!("获取位图失败: {}", e))?
+        .get()
+        .map_err(|e| format!("等待位图获取失败: {}", e))?;
+
+    // 尝试中文引擎
+    if let Ok(lang) = Language::CreateLanguage(&HSTRING::from("zh-Hans-CN")) {
+        if OcrEngine::IsLanguageSupported(&lang).unwrap_or(false) {
+            if let Ok(engine) = OcrEngine::TryCreateFromLanguage(&lang) {
+                if let Ok(result) = engine.RecognizeAsync(&bitmap) {
+                    if let Ok(result) = result.get() {
+                        if let Ok(text) = result.Text() {
+                            let text_str = text.to_string();
+                            if !text_str.trim().is_empty() {
+                                return Ok(OcrResult {
+                                    text: text_str,
+                                    language: "windows-zh".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 尝试默认引擎
+    if let Ok(engine) = OcrEngine::TryCreateFromUserProfileLanguages() {
+        if let Ok(result) = engine.RecognizeAsync(&bitmap) {
+            if let Ok(result) = result.get() {
+                if let Ok(text) = result.Text() {
+                    return Ok(OcrResult {
+                        text: text.to_string(),
+                        language: "windows-default".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(OcrResult {
+        text: String::new(),
+        language: "none".to_string(),
+    })
+}
+
+/// 文本后处理：清理中文字符间的多余空格
+#[cfg(windows)]
+fn postprocess_text(text: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = text.chars().collect();
+
+    for i in 0..chars.len() {
+        let current = chars[i];
+
+        if current == ' ' {
+            let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+            let next = if i + 1 < chars.len() { Some(chars[i + 1]) } else { None };
+
+            let prev_is_cjk = prev.map(is_cjk_char).unwrap_or(false);
+            let next_is_cjk = next.map(is_cjk_char).unwrap_or(false);
+
+            if prev_is_cjk && next_is_cjk {
+                continue;
+            }
+        }
+
+        result.push(current);
+    }
+
+    result
+}
+
+/// 检查字符是否是 CJK 字符
+#[cfg(windows)]
+fn is_cjk_char(c: char) -> bool {
+    let code = c as u32;
+    (0x4E00..=0x9FFF).contains(&code)
+        || (0x3400..=0x4DBF).contains(&code)
+        || (0x3000..=0x303F).contains(&code)
+        || (0xFF00..=0xFFEF).contains(&code)
+}

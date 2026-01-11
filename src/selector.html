@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>区域选择</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      cursor: crosshair;
+      /* 截图将作为背景 */
+      background-size: cover;
+      background-position: top left;
+      background-repeat: no-repeat;
+    }
+
+    /* 半透明遮罩层 */
+    #overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(0, 0, 0, 0.3);
+      pointer-events: none;
+    }
+
+    #selection-box {
+      position: absolute;
+      border: 2px solid #00b4ff;
+      background-color: rgba(0, 180, 255, 0.1);
+      display: none;
+      pointer-events: none;
+      /* 选中区域显示清晰的背景 */
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.3);
+    }
+
+    #info-box {
+      position: absolute;
+      background-color: rgba(0, 0, 0, 0.8);
+      color: #00b4ff;
+      padding: 4px 8px;
+      border-radius: 3px;
+      font-size: 12px;
+      font-family: monospace;
+      display: none;
+      pointer-events: none;
+      z-index: 100;
+    }
+
+    #tip {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background-color: rgba(0, 0, 0, 0.9);
+      color: white;
+      padding: 20px 40px;
+      border-radius: 8px;
+      font-size: 16px;
+      text-align: center;
+      pointer-events: none;
+      z-index: 1000;
+    }
+
+    #tip kbd {
+      background-color: #333;
+      padding: 2px 6px;
+      border-radius: 3px;
+      border: 1px solid #555;
+      font-family: monospace;
+      margin: 0 2px;
+    }
+
+    #loading {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background-color: rgba(0, 0, 0, 0.9);
+      color: white;
+      padding: 20px 40px;
+      border-radius: 8px;
+      font-size: 16px;
+      z-index: 2000;
+    }
+  </style>
+</head>
+<body>
+  <div id="loading">正在准备...</div>
+  <div id="overlay"></div>
+  <div id="tip" style="display: none;">
+    拖拽鼠标框选区域<br>
+    按 <kbd>ESC</kbd> 取消
+  </div>
+  <div id="selection-box"></div>
+  <div id="info-box"></div>
+
+  <script>
+    const { invoke } = window.__TAURI__.core;
+
+    const selectionBox = document.getElementById('selection-box');
+    const infoBox = document.getElementById('info-box');
+    const tip = document.getElementById('tip');
+    const loading = document.getElementById('loading');
+    const overlay = document.getElementById('overlay');
+
+    let isSelecting = false;
+    let startX = 0, startY = 0;
+    let currentX = 0, currentY = 0;
+    let isReady = false;
+
+    // 获取 URL 参数中的模式
+    const urlParams = new URLSearchParams(window.location.search);
+    const scanMode = urlParams.get('mode') || 'qr';
+    console.log('[DEBUG] 扫描模式:', scanMode);
+
+    // 加载截图数据
+    async function loadScreenshot() {
+      console.log('[DEBUG] 正在加载截图数据...');
+
+      try {
+        const dataUrl = await invoke('get_screenshot_data');
+        console.log('[DEBUG] 收到截图数据，长度:', dataUrl.length);
+
+        // 创建一个临时图片来获取截图的实际尺寸
+        const img = new Image();
+        img.onload = function() {
+          console.log('[DEBUG] 截图实际尺寸: ' + img.width + 'x' + img.height);
+
+          // 计算缩放比例
+          const scaleX = img.width / window.innerWidth;
+          const scaleY = img.height / window.innerHeight;
+          console.log('[DEBUG] 缩放比例: scaleX=' + scaleX.toFixed(4) + ', scaleY=' + scaleY.toFixed(4));
+
+          // 保存缩放比例供后续使用
+          window.screenshotScaleX = scaleX;
+          window.screenshotScaleY = scaleY;
+        };
+        img.src = dataUrl;
+
+        // 设置截图为背景
+        document.body.style.backgroundImage = `url(${dataUrl})`;
+        document.body.style.backgroundSize = '100% 100%';
+
+        // 隐藏加载提示，显示操作提示
+        loading.style.display = 'none';
+        tip.style.display = 'block';
+        isReady = true;
+
+        console.log('[DEBUG] 选择器已就绪');
+      } catch (error) {
+        console.error('[DEBUG] 获取截图数据失败:', error);
+        loading.textContent = '加载失败: ' + error;
+      }
+    }
+
+    // 页面加载后立即获取截图数据
+    console.log('[DEBUG] 选择器窗口已加载');
+    loadScreenshot();
+
+    // 鼠标按下
+    document.addEventListener('mousedown', (e) => {
+      if (!isReady) return;
+
+      isSelecting = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      currentX = e.clientX;
+      currentY = e.clientY;
+
+      selectionBox.style.display = 'block';
+      infoBox.style.display = 'block';
+      tip.style.display = 'none';
+      overlay.style.display = 'none'; // 隐藏遮罩，让选择框的 box-shadow 生效
+
+      updateSelection();
+
+      console.log('[DEBUG] 鼠标按下: x=' + e.clientX + ', y=' + e.clientY);
+    });
+
+    // 鼠标移动
+    document.addEventListener('mousemove', (e) => {
+      if (!isSelecting) return;
+
+      currentX = e.clientX;
+      currentY = e.clientY;
+
+      updateSelection();
+    });
+
+    // 鼠标抬起
+    document.addEventListener('mouseup', async (e) => {
+      if (!isSelecting) return;
+      isSelecting = false;
+
+      // 使用窗口坐标计算选择区域
+      const x = Math.min(startX, currentX);
+      const y = Math.min(startY, currentY);
+      const width = Math.abs(currentX - startX);
+      const height = Math.abs(currentY - startY);
+
+      console.log('[DEBUG] 选择完成 (窗口坐标): x=' + x + ', y=' + y + ', w=' + width + ', h=' + height);
+
+      // 最小选择区域限制
+      if (width < 20 || height < 20) {
+        console.log('[DEBUG] 区域太小，取消');
+        await invoke('cancel_region_selection');
+        return;
+      }
+
+      // 应用缩放比例，将窗口坐标转换为截图坐标
+      const scaleX = window.screenshotScaleX || 1;
+      const scaleY = window.screenshotScaleY || 1;
+
+      const scaledX = Math.round(x * scaleX);
+      const scaledY = Math.round(y * scaleY);
+      const scaledWidth = Math.round(width * scaleX);
+      const scaledHeight = Math.round(height * scaleY);
+
+      console.log('[DEBUG] 缩放后坐标: x=' + scaledX + ', y=' + scaledY + ', w=' + scaledWidth + ', h=' + scaledHeight);
+      console.log('[DEBUG] 使用的缩放比例: scaleX=' + scaleX + ', scaleY=' + scaleY);
+
+      // 根据模式调用不同的完成命令
+      try {
+        console.log('[DEBUG] 提交区域选择，模式:', scanMode);
+        if (scanMode === 'ocr') {
+          await invoke('complete_ocr_region_selection', {
+            x: scaledX,
+            y: scaledY,
+            width: scaledWidth,
+            height: scaledHeight
+          });
+        } else {
+          await invoke('complete_region_selection', {
+            x: scaledX,
+            y: scaledY,
+            width: scaledWidth,
+            height: scaledHeight
+          });
+        }
+      } catch (error) {
+        console.error('[ERROR] 提交选择失败:', error);
+        await invoke('cancel_region_selection');
+      }
+    });
+
+    // ESC 取消
+    document.addEventListener('keydown', async (e) => {
+      if (e.key === 'Escape') {
+        await invoke('cancel_region_selection');
+      }
+    });
+
+    // 更新选择框
+    function updateSelection() {
+      const x = Math.min(startX, currentX);
+      const y = Math.min(startY, currentY);
+      const width = Math.abs(currentX - startX);
+      const height = Math.abs(currentY - startY);
+
+      selectionBox.style.left = x + 'px';
+      selectionBox.style.top = y + 'px';
+      selectionBox.style.width = width + 'px';
+      selectionBox.style.height = height + 'px';
+
+      infoBox.textContent = `${width} × ${height}`;
+      infoBox.style.left = (x + 5) + 'px';
+      infoBox.style.top = (y - 25) + 'px';
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,69 @@
+[package]
+name = "glimpse"
+version = "0.1.0"
+description = "灵视 - Windows 桌面端二维码识别工具"
+authors = ["Glimpse Team"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "glimpse_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 二维码识别
+rqrr = "0.8"
+
+# OCR 文字识别 - 使用 paddle-ocr-rs (基于 ONNX Runtime，支持中文)
+paddle-ocr-rs = "0.5"
+# 锁定 ort 版本以确保兼容性
+ort = "=2.0.0-rc.9"
+ndarray = "0.16"
+
+# 目录操作
+dirs = "6.0"
+
+# 截图
+screenshots = "0.7"
+
+# 图像处理
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Base64 编码
+base64 = "0.22"
+
+# 异步运行时（用于异步延迟）
+tokio = { version = "1", features = ["time"] }
+
+# Windows OCR API
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization"
+] }
+
+# 性能优化配置
+[profile.release]
+strip = true       # 去除调试符号
+lto = true         # 链接时优化
+codegen-units = 1  # 单编译单元，提升优化效果
+opt-level = "z"    # 优化体积
+panic = "abort"    # 减小二进制大小
+
