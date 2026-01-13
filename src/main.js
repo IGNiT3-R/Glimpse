@@ -35,6 +35,9 @@ window.addEventListener("DOMContentLoaded", () => {
   initTauriListeners();
   initTheme();
   initSettings();
+  
+  // 禁用浏览器默认右键菜单
+  document.addEventListener("contextmenu", (e) => e.preventDefault());
 });
 
 // 初始化 DOM 元素引用
