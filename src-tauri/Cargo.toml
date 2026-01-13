@@ -1,6 +1,6 @@
 [package]
 name = "glimpse"
-version = "0.1.0"
+version = "0.1.1"
 description = "灵视 - Windows 桌面端二维码识别工具"
 authors = ["Glimpse Team"]
 edition = "2021"
